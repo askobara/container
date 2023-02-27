@@ -27,6 +27,6 @@ lazy_static = "1.4.0"
 colored_json = "3.0.1"
 skim = "0.10.2"
 directories = "4.0.1"
-chrono = "0.4.23"
+chrono = { version = "0.4.23", default-features = false }
 bollard = "0.14.0"
 bytes = "1.4.0"

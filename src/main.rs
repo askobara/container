@@ -3,20 +3,17 @@ extern crate lazy_static;
 
 use anyhow::Result;
 use futures::{StreamExt, TryStreamExt};
-use skim::prelude::*;
 
 use clap::{Command, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Generator, Shell};
 use k8s_openapi::api::core::v1 as corev1;
 use kube::{
-    api::{Api, ListParams, LogParams, ResourceExt},
+    api::{Api, LogParams},
     Client,
 };
 
-use colored_json::{ColoredFormatter, CompactFormatter};
 use console::style;
 use regex::Regex;
-use tracing::error;
 use utils::*;
 
 mod utils;
@@ -31,46 +28,44 @@ lazy_static! {
     static ref SYMFONY_LOG_RE: Regex = Regex::new(
         r"(?x)^
         \[(?P<dt>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+[-\+]\d{2}:\d{2})\]
-        \s+
-        (?P<level>\w+\.\w+):
-        \s+
-        (?:\[(?P<class>[^\]]+)\]\s+)?
+        (?:\s+(?P<level>\w+\.\w+):)
+        (?:\s+\[(?P<class>[^\]]+)\]\s+)?
         (?P<msg>.+)
-    $"
-    )
-    .unwrap();
+    $").unwrap();
+
     static ref NGINX_LOG_RE: Regex = Regex::new(
         r#"(?x)^
         "(?P<dt>\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s\+\d{4})"
-        \s+
-        (?P<msg>.+)
-    $"#
-    )
-    .unwrap();
-    static ref PROXY_LOG_RE: Regex = Regex::new(
+        (?:\s+(?P<msg>.+))
+    $"#).unwrap();
+
+    static ref PROXY_LOG_RE: Regex = Regex::new( // nginx
         r"(?x)^
         (?P<ip>((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4})
-        \s+
-        (?P<hz>.+)
-        \s+
-        (?P<dt>\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s\+\d{4})
-        \s+
-        (?P<msg>.+)
-    $"
-    )
-    .unwrap();
+        (?:\s+-)
+        (?:\s+(?P<username>.+))
+        (?:\s+\[?(?P<dt>\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s\+\d{4})\]?)
+        (?:\s+(?P<msg>.+))
+    $").unwrap();
+
     static ref PHPFPM_LOG_RE: Regex = Regex::new(
         r"(?x)^
         \[(?P<dt>\d{2}-\w{3}-\d{4}\s\d{2}:\d{2}:\d{2})\]
-        \s+
-        (?P<lvl>\w+):
-        \s+
-        \[(?P<instance>.+)\]
-        \s+
-        (?P<msg>.+)
-    $"
-    )
-    .unwrap();
+        (?:\s+(?P<lvl>\w+):)
+        (?:\s+\[(?P<instance>.+)\])
+        (?:\s+(?P<msg>.+))
+    $").unwrap();
+
+    static ref PHP_MESSAGE_LOG_RE: Regex = Regex::new(
+        r"(?x)^
+        NOTICE:\sPHP\smessage:
+        (?:\s(?P<dt>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:.\d+)?[-\+]\d{2}:\d{2}))
+        (?:\s\[(?P<lvl>\w+)\])
+        (?:\s+(?P<msg>.+))
+        $"
+    ).unwrap();
+
+    static ref FASTCGI_ERROR_LOG_RE: Regex = Regex::new("FastCGI sent in stderr").unwrap();
     static ref REPLACE: Regex = Regex::new(r"\s\s+").unwrap();
 }
 
@@ -97,46 +92,12 @@ enum Commands {
     },
 }
 
-fn search_json(str: &str) -> Vec<std::ops::Range<usize>> {
-    let mut vec: Vec<std::ops::Range<usize>> = vec![];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut inside_str = false;
-
-    for (i, c) in str.bytes().enumerate() {
-        if c == b'{' && !inside_str {
-            stack.push(i);
-        } else if c == b'"' {
-            inside_str = !inside_str;
-        } else if c == b'}' && !inside_str {
-            if let Some(start) = stack.pop() {
-                if stack.is_empty() {
-                    vec.push(std::ops::Range { start, end: i + 1 });
-                }
-            }
-        }
-    }
-
-    vec
-}
-
-fn parse_bytes(str: &str) -> Result<()> {
+fn parse_log_str(str: &str) -> Result<()> {
     if let Some(cap) = SYMFONY_LOG_RE.captures(&str) {
         match &cap["level"] {
             "security.DEBUG" | "security.INFO" => {}
             _ => {
                 // let mut msg = REPLACE.replace_all(&cap["msg"], " ").to_string();
-                let msg = &mut cap["msg"].to_string();
-
-                for range in search_json(&msg) {
-                    let colored = serde_json::from_str(&msg[range.clone()]).and_then(|json| {
-                        ColoredFormatter::new(CompactFormatter {}).to_colored_json_auto(&json)
-                    });
-
-                    match colored {
-                        Ok(slice) => msg.replace_range(range, &slice),
-                        Err(e) => error!("{:?}", e),
-                    };
-                }
 
                 let dt = chrono::DateTime::parse_from_rfc3339(&cap["dt"])?;
 
@@ -147,34 +108,29 @@ fn parse_bytes(str: &str) -> Result<()> {
                     class = cap
                         .name("class")
                         .map(|class| format!(" [{}]", style(class.as_str()).magenta()))
-                        .unwrap_or(Default::default())
+                        .unwrap_or(Default::default()),
+                    msg = find_and_color_json(&mut cap["msg"].to_string()),
                 );
             }
         }
-    } else if let Some(_cap) = NGINX_LOG_RE.captures(&str) {
-        // println!(
-        //     "[{}] {}",
-        //     style(&cap["dt"]).yellow(),
-        //     &cap["msg"]
-        // );
-    } else if let Some(_cap) = PROXY_LOG_RE.captures(&str) {
-        // println!(
-        //     "{} {} [{}] {}",
-        //     &cap["ip"],
-        //     &cap["hz"],
-        //     style(&cap["dt"]).yellow(),
-        //     &cap["msg"]
-        // );
-    } else if let Some(_cap) = PHPFPM_LOG_RE.captures(&str) {
-        // println!(
-        //     "[{}] {}: [{}] {}",
-        //     style(&cap["dt"]).yellow(),
-        //     style(&cap["lvl"]).bright().bold(),
-        //     &cap["instance"],
-        //     &cap["msg"]
-        // );
+    } else if let Some(cap) = PHP_MESSAGE_LOG_RE.captures(&str) {
+        println!(
+            "[{}] {} {}",
+            style(&cap["dt"]).yellow(),
+            style(&cap["lvl"]).bright().bold(),
+            &cap["msg"]
+        );
+    } else if NGINX_LOG_RE.is_match(&str) {
+        println!("NGINX_LOG_RE::::{str}");
+        // ignore
+    } else if PROXY_LOG_RE.is_match(&str) {
+        // ignore
+    } else if FASTCGI_ERROR_LOG_RE.is_match(&str) {
+        // ignore
+    } else if PHPFPM_LOG_RE.is_match(&str) {
+        // ignore
     } else if !str.is_empty() {
-        println!("------ {str:?}");
+        println!("{}", find_and_color_json(&mut str.to_string()));
     }
 
     Ok(())
@@ -194,7 +150,7 @@ async fn parse_kube_stream(
 
             if (it.peek().is_some() || is_last_chunk) && !buffer.is_empty() {
                 let str = String::from_utf8_lossy(&buffer);
-                parse_bytes(&str)?;
+                parse_log_str(&str)?;
                 buffer.clear();
             }
         }
@@ -217,7 +173,7 @@ async fn parse_docker_stream(
 
             if is_last && !buffer.is_empty() {
                 for str in String::from_utf8_lossy(&buffer).split(|c| c == '\n') {
-                    parse_bytes(&str)?;
+                    parse_log_str(&str)?;
                 }
                 buffer.clear();
             }
@@ -225,21 +181,6 @@ async fn parse_docker_stream(
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct InnerNamespace {
-    value: String,
-}
-
-impl SkimItem for InnerNamespace {
-    fn text(&self) -> Cow<str> {
-        Cow::Borrowed(&self.value)
-    }
-
-    fn preview(&self, _context: PreviewContext) -> ItemPreview {
-        ItemPreview::Text(format!("{self:#?}"))
-    }
 }
 
 fn print_completions<G: Generator>(gen: G, cmd: &mut Command) {
@@ -268,17 +209,23 @@ async fn main() -> Result<()> {
                 if local {
                     let docker = Docker::connect_with_local_defaults()?;
 
-                    let options = Some(bollard::container::ListContainersOptions {
-                        all: false,
-                        ..Default::default()
-                    });
+                    let options = Some(bollard::container::ListContainersOptions::default());
                     let containers = docker.list_containers::<String>(options).await?;
 
-                    let n: Vec<String> = containers
+                    let names = containers
                         .iter()
-                        .flat_map(|c| c.names.clone().unwrap_or(Vec::new()))
-                        .collect();
-                    let w = select_one(n, container.as_deref())?;
+                        .flat_map(|c| c.names.as_deref().unwrap_or_default())
+                        .map(|c| {
+                            let name = if c.starts_with('/') {
+                                c.split_at('/'.len_utf8()).1
+                            } else {
+                                &c
+                            };
+
+                            name.to_owned()
+                        });
+
+                    let container_name = select_one(names, container.as_deref())?;
 
                     let options = Some(bollard::container::LogsOptions {
                         stdout: true,
@@ -286,38 +233,20 @@ async fn main() -> Result<()> {
                         tail: "500",
                         ..Default::default()
                     });
-                    let logs = docker.logs(&w[1..], options);
-                    parse_docker_stream(logs).await?;
+                    let logs = docker.logs(&container_name, options);
+
+                    parse_docker_stream(logs.boxed()).await?;
                 } else {
                     let client = Client::try_default().await?;
                     let all_ns: Api<corev1::Namespace> = Api::all(client.clone());
-                    let ns = all_ns
-                        .list(&ListParams::default())
-                        .await
-                        .map_err(anyhow::Error::new)
-                        .and_then(|result| {
-                            let items = result.iter().map(|item| InnerNamespace {
-                                value: item.name_any(),
-                            });
-                            select_one(items, namespace.as_deref())
-                        })?;
+                    let ns = kube_select_one(&all_ns, namespace.as_deref()).await?;
 
-                    let pods: Api<corev1::Pod> = Api::namespaced(client, &ns.value);
-
-                    let pod = pods
-                        .list(&ListParams::default())
-                        .await
-                        .map_err(anyhow::Error::new)
-                        .and_then(|result| {
-                            let items = result.iter().map(|item| InnerNamespace {
-                                value: item.name_any(),
-                            });
-                            select_one(items, container.as_deref())
-                        })?;
+                    let pods: Api<corev1::Pod> = Api::namespaced(client, &ns);
+                    let pod = kube_select_one(&pods, container.as_deref()).await?;
 
                     let logs = pods
                         .log_stream(
-                            &pod.value,
+                            &pod,
                             &LogParams {
                                 since_seconds: Some(1 * 60 * 60),
                                 // tail_lines: Some(500),
