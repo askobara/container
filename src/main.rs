@@ -43,7 +43,7 @@ lazy_static! {
         r"(?x)^
         (?P<ip>((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4})
         (?:\s+-)
-        (?:\s+(?P<username>.+))
+        (?:\s+(?P<username>.+)?)
         (?:\s+\[?(?P<dt>\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}\s\+\d{4})\]?)
         (?:\s+(?P<msg>.+))
     $").unwrap();
@@ -84,15 +84,15 @@ enum Commands {
     #[command()]
     Logs {
         #[arg(short, long)]
-        local: bool,
-        #[arg(short, long)]
         container: Option<String>,
         #[arg(short, long)]
         namespace: Option<String>,
+        #[arg(long)]
+        since: Option<u8>,
     },
 }
 
-fn parse_log_str(str: &str) -> Result<()> {
+fn parse_log_str(str: &str, json_ranges: Vec<std::ops::Range<usize>>) -> Result<()> {
     if let Some(cap) = SYMFONY_LOG_RE.captures(&str) {
         match &cap["level"] {
             "security.DEBUG" | "security.INFO" => {}
@@ -100,6 +100,8 @@ fn parse_log_str(str: &str) -> Result<()> {
                 // let mut msg = REPLACE.replace_all(&cap["msg"], " ").to_string();
 
                 let dt = chrono::DateTime::parse_from_rfc3339(&cap["dt"])?;
+                let ranges = find_json_ranges(&cap["msg"]).unwrap_or_default();
+                let msg = make_json_colored(&cap["msg"], ranges);
 
                 println!(
                     "[{timestamp}] {lvl}:{class} {msg}",
@@ -109,7 +111,6 @@ fn parse_log_str(str: &str) -> Result<()> {
                         .name("class")
                         .map(|class| format!(" [{}]", style(class.as_str()).magenta()))
                         .unwrap_or(Default::default()),
-                    msg = find_and_color_json(&mut cap["msg"].to_string()),
                 );
             }
         }
@@ -121,7 +122,6 @@ fn parse_log_str(str: &str) -> Result<()> {
             &cap["msg"]
         );
     } else if NGINX_LOG_RE.is_match(&str) {
-        println!("NGINX_LOG_RE::::{str}");
         // ignore
     } else if PROXY_LOG_RE.is_match(&str) {
         // ignore
@@ -130,7 +130,7 @@ fn parse_log_str(str: &str) -> Result<()> {
     } else if PHPFPM_LOG_RE.is_match(&str) {
         // ignore
     } else if !str.is_empty() {
-        println!("{}", find_and_color_json(&mut str.to_string()));
+        println!("{}↵", make_json_colored(str, json_ranges));
     }
 
     Ok(())
@@ -143,14 +143,17 @@ async fn parse_kube_stream(
 
     while let Some(line) = stream.try_next().await? {
         let mut it = line.split(|n| *n == b'\n').peekable();
-        let is_last_chunk = line.last().map(|n| *n == b'\n').unwrap_or(false);
+        let is_last = line.ends_with(&[b'\n']);
 
         while let Some(chunk) = it.next() {
             buffer.extend_from_slice(chunk);
 
-            if (it.peek().is_some() || is_last_chunk) && !buffer.is_empty() {
-                let str = String::from_utf8_lossy(&buffer);
-                parse_log_str(&str)?;
+            let str = String::from_utf8_lossy(&buffer);
+            let r = find_json_ranges(&str);
+
+            if (it.peek().is_some() || is_last) && r.is_ok() {
+                parse_log_str(&str, r.unwrap())?;
+                // println!("{}", make_json_colored(&str, r.unwrap()));
                 buffer.clear();
             }
         }
@@ -173,7 +176,7 @@ async fn parse_docker_stream(
 
             if is_last && !buffer.is_empty() {
                 for str in String::from_utf8_lossy(&buffer).split(|c| c == '\n') {
-                    parse_log_str(&str)?;
+                    parse_log_str(&str, vec![])?;
                 }
                 buffer.clear();
             }
@@ -202,11 +205,13 @@ async fn main() -> Result<()> {
     } else if let Some(command) = cli.command {
         match command {
             Commands::Logs {
-                local,
                 container,
                 namespace,
+                since,
             } => {
-                if local {
+                let since: i64 = since.unwrap_or(1).into();
+
+                if namespace.is_none() {
                     let docker = Docker::connect_with_local_defaults()?;
 
                     let options = Some(bollard::container::ListContainersOptions::default());
@@ -227,10 +232,10 @@ async fn main() -> Result<()> {
 
                     let container_name = select_one(names, container.as_deref())?;
 
-                    let options = Some(bollard::container::LogsOptions {
+                    let options = Some(bollard::container::LogsOptions::<String> {
                         stdout: true,
                         stderr: true,
-                        tail: "500",
+                        since: (chrono::offset::Utc::now() - chrono::Duration::hours(since)).timestamp(),
                         ..Default::default()
                     });
                     let logs = docker.logs(&container_name, options);
@@ -248,8 +253,7 @@ async fn main() -> Result<()> {
                         .log_stream(
                             &pod,
                             &LogParams {
-                                since_seconds: Some(1 * 60 * 60),
-                                // tail_lines: Some(500),
+                                since_seconds: Some(since * 60 * 60),
                                 ..LogParams::default()
                             },
                         )

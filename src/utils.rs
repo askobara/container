@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
-use kube::api::{Api, ListParams, Resource, ResourceExt};
 use colored_json::{ColoredFormatter, CompactFormatter};
+use kube::api::{Api, ListParams, Resource, ResourceExt};
 use skim::prelude::*;
+use std::borrow::Cow;
+use std::ops::Range;
 
 fn skim_select<I, T>(data: I, options: &SkimOptions) -> Result<Vec<T>>
 where
@@ -92,28 +94,6 @@ pub fn format_datetime(datetime: &chrono::DateTime<chrono::FixedOffset>) -> Stri
     }
 }
 
-pub fn search_json(str: &str) -> Vec<std::ops::Range<usize>> {
-    let mut vec: Vec<std::ops::Range<usize>> = vec![];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut inside_str = false;
-
-    for (i, c) in str.bytes().enumerate() {
-        if c == b'{' && !inside_str {
-            stack.push(i);
-        } else if c == b'"' {
-            inside_str = !inside_str;
-        } else if c == b'}' && !inside_str {
-            if let Some(start) = stack.pop() {
-                if stack.is_empty() {
-                    vec.push(std::ops::Range { start, end: i + 1 });
-                }
-            }
-        }
-    }
-
-    vec
-}
-
 pub async fn kube_select_one<K>(data: &Api<K>, str: Option<&str>) -> Result<String>
 where
     K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -128,19 +108,52 @@ where
         })
 }
 
-pub fn find_and_color_json(str: &mut String) -> &str {
-    for range in search_json(&str) {
-        let colored = serde_json::from_str(&str[range.clone()]).and_then(
-            |json: serde_json::Value| {
-                ColoredFormatter::new(CompactFormatter {}).to_colored_json_auto(&json)
-            },
-        );
+pub fn find_json_ranges(str: &str) -> Result<Vec<Range<usize>>> {
+    let mut vec: Vec<Range<usize>> = vec![];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut inside_str = false;
 
-        match colored {
-            Ok(slice) => str.replace_range(range, &slice),
-            Err(e) => tracing::error!("{:?}", e),
-        };
+    for (i, c) in str.bytes().enumerate() {
+        if c == b'{' && !inside_str {
+            stack.push(i);
+        } else if c == b'"' {
+            inside_str = !inside_str;
+        } else if c == b'}' && !inside_str {
+            if let Some(start) = stack.pop() {
+                if stack.is_empty() {
+                    vec.push(Range { start, end: i + 1 });
+                }
+            }
+        }
     }
 
-    str
+    if !stack.is_empty() {
+        anyhow::bail!("no full log")
+    }
+
+    Ok(vec)
+}
+
+pub fn make_json_colored(str: &str, ranges: Vec<Range<usize>>) -> Cow<str> {
+    if !ranges.is_empty() {
+        let mut str = str.to_string();
+
+        for range in ranges {
+            let colored = serde_json::from_str(&str[range.clone()]).and_then(
+                |json: serde_json::Value| {
+                    ColoredFormatter::new(CompactFormatter {}).to_colored_json_auto(&json)
+                },
+            );
+
+            match colored {
+                Ok(slice) => str.replace_range(range, &slice),
+                Err(e) => tracing::error!("{:?}", e),
+            };
+
+        }
+
+        Cow::Owned(str)
+    } else {
+        Cow::Borrowed(str)
+    }
 }
