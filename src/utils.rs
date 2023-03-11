@@ -134,9 +134,11 @@ pub fn find_json_ranges(str: &str) -> Result<Vec<Range<usize>>> {
     Ok(vec)
 }
 
-pub fn make_json_colored(str: &str, ranges: Vec<Range<usize>>) -> Cow<str> {
+pub fn make_json_colored(str: &str, mut ranges: Vec<Range<usize>>) -> Cow<str> {
     if !ranges.is_empty() {
         let mut str = str.to_string();
+
+        ranges.reverse();
 
         for range in ranges {
             let colored = serde_json::from_str(&str[range.clone()]).and_then(
