@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = "1.0"
 clap = { version = "4.0.29", features = ["derive", "env"] }
 clap_complete = "4.0.6"
-kube = { version = "0.77.0", features = ["runtime", "derive"] }
+kube = { version = "0.77.0", features = ["runtime", "derive", "ws"] }
 k8s-openapi = { version = "0.16.0", features = ["v1_25"] }
 tracing = "0.1"
 tracing-subscriber = "0.2.0"
@@ -30,3 +30,4 @@ directories = "4.0.1"
 chrono = { version = "0.4.23", default-features = false }
 bollard = "0.14.0"
 bytes = "1.4.0"
+tokio-util = "0.7.7"

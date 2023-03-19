@@ -8,6 +8,7 @@ use clap::{Command, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Generator, Shell};
 mod utils;
 mod logs;
+mod env;
 
 #[derive(Debug, Parser)]
 #[command(name = "container", author, version, about, long_about = None)] // Read from `Cargo.toml`
@@ -31,6 +32,13 @@ enum Commands {
         since: Option<u8>,
         #[arg(short, long)]
         follow: bool,
+    },
+    #[command()]
+    Env {
+        #[arg(short, long)]
+        container: Option<String>,
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 
@@ -59,6 +67,10 @@ async fn main() -> Result<()> {
                 follow,
             } => {
                 crate::logs::process_logs(namespace.as_deref(), container.as_deref(), since, follow).await?;
+            }
+
+            Commands::Env { container, namespace } => {
+                crate::env::process_env(namespace.as_deref(), container.as_deref()).await?;
             }
         }
     }
